@@ -1,5 +1,6 @@
 import io
 import zipfile
+import gzip
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -443,6 +444,18 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
       - timeseries_by_key dict: key -> timeseries df (para FIT/TCX)
     """
     z = zipfile.ZipFile(BytesIO(file_bytes))
+    # Conteo por extensión (debug)
+    file_counts = {"fit":0,"fit.gz":0,"tcx":0,"tcx.gz":0,"gpx":0,"gpx.gz":0,"csv":0}
+    for n in z.namelist():
+        ln = n.lower()
+        if ln.endswith(".fit.gz"): file_counts["fit.gz"] += 1
+        elif ln.endswith(".fit"): file_counts["fit"] += 1
+        elif ln.endswith(".tcx.gz"): file_counts["tcx.gz"] += 1
+        elif ln.endswith(".tcx"): file_counts["tcx"] += 1
+        elif ln.endswith(".gpx.gz"): file_counts["gpx.gz"] += 1
+        elif ln.endswith(".gpx"): file_counts["gpx"] += 1
+        elif ln.endswith(".csv"): file_counts["csv"] += 1
+
     activities: List[dict] = []
     ts_map: Dict[str, pd.DataFrame] = {}
 
@@ -452,42 +465,55 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
     for name in z.namelist():
         lname = name.lower()
         try:
-            data = z.read(name)
+            raw = z.read(name)
         except Exception:
             continue
 
+        # Descomprimir si viene como .gz (muy habitual en export de Strava)
+        data = raw
+        if lname.endswith(".gz"):
+            try:
+                data = gzip.decompress(raw)
+            except Exception:
+                # si no es un gzip válido, seguimos con el raw
+                data = raw
+
+        # activities.csv dentro del ZIP (fallback)
         if lname.endswith("activities.csv") or lname.endswith("activity.csv"):
             try:
                 csv_frames.append(parse_strava_csv_basic(data))
             except Exception:
                 pass
 
-        if lname.endswith(".fit"):
+        # FIT / TCX / GPX (normal o .gz)
+        if lname.endswith(".fit") or lname.endswith(".fit.gz"):
             try:
                 summ, ts = parse_fit_pro(data)
                 key = f"{name}"
                 activities.append({**summ, "key": key, "file": name})
-                if not ts.empty:
+                if ts is not None and not ts.empty:
                     ts_map[key] = ts
             except Exception:
                 continue
-        elif lname.endswith(".tcx"):
+
+        elif lname.endswith(".tcx") or lname.endswith(".tcx.gz"):
             try:
                 summ, ts = parse_tcx_pro(data)
                 key = f"{name}"
                 activities.append({**summ, "key": key, "file": name})
-                if not ts.empty:
+                if ts is not None and not ts.empty:
                     ts_map[key] = ts
             except Exception:
                 continue
-        elif lname.endswith(".gpx"):
-            # GPX básico
+
+        elif lname.endswith(".gpx") or lname.endswith(".gpx.gz"):
             try:
                 summ = parse_gpx_basic(data)
                 key = f"{name}"
                 activities.append({**summ, "key": key, "file": name})
             except Exception:
                 continue
+
 
     act_df = pd.DataFrame(activities)
     if act_df.empty and csv_frames:
@@ -499,9 +525,8 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         # Si tenemos FIT/TCX/GPX y también CSV, podemos intentar rellenar sport faltante (other)
         csv_df = pd.concat(csv_frames, ignore_index=True)
         # emparejar por fecha cercana y distancia aproximada (heurística)
-        # Normalizamos a datetime sin zona horaria para evitar comparaciones tz-aware vs tz-naive
-        act_df["start_dt"] = pd.to_datetime(act_df["start_dt"], errors="coerce", utc=True).dt.tz_convert(None)
-        csv_df["start_dt"] = pd.to_datetime(csv_df["start_dt"], errors="coerce", utc=True).dt.tz_convert(None)
+        act_df["start_dt"] = pd.to_datetime(act_df["start_dt"], errors="coerce")
+        csv_df["start_dt"] = pd.to_datetime(csv_df["start_dt"], errors="coerce")
         for idx, row in act_df.iterrows():
             if str(row.get("sport")) != "other":
                 continue
@@ -521,12 +546,13 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         act_df = pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source","key","file"])
 
     # Normalizar
-    act_df["start_dt"] = pd.to_datetime(act_df.get("start_dt"), errors="coerce", utc=True).dt.tz_convert(None)
+    act_df["start_dt"] = pd.to_datetime(act_df.get("start_dt"), errors="coerce")
     for c in ["distance_km","moving_min","avg_hr","avg_speed_mps"]:
         if c not in act_df.columns:
             act_df[c] = np.nan
         act_df[c] = pd.to_numeric(act_df[c], errors="coerce")
 
+    act_df.attrs["file_counts"] = file_counts
     return act_df, ts_map
 
 # ============================================================
@@ -938,6 +964,11 @@ if uploaded is None:
 
 # Parse ZIP PRO
 activities_df, ts_map = parse_zip_pro(uploaded.getvalue())
+file_counts = getattr(activities_df, "attrs", {}).get("file_counts", None)
+if file_counts:
+    with st.expander("Qué tipos de archivos he encontrado dentro del ZIP"):
+        st.write(file_counts)
+        st.caption("Si Strava exporta .fit.gz/.tcx.gz, ahora también los procesamos.")
 if activities_df.empty:
     st.error("No he podido leer actividades del ZIP. Prueba con un ZIP que contenga FIT/TCX/GPX o activities.csv.")
     st.stop()
