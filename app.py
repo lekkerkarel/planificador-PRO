@@ -157,6 +157,17 @@ def _to_datetime_safe(s) -> Optional[datetime]:
     except Exception:
         return None
 
+def _to_naive_utc(s: pd.Series) -> pd.Series:
+    """Convierte a datetime UTC y devuelve naive (sin tz), evitando comparaciones tz-aware vs tz-naive."""
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    # tz_convert(None) deja naive en UTC
+    try:
+        return dt.dt.tz_convert(None)
+    except Exception:
+        # si ya es naive
+        return pd.to_datetime(dt, errors="coerce")
+
+
 def _week_start_monday(ts: pd.Timestamp) -> pd.Timestamp:
     d = ts.normalize()
     return d - pd.Timedelta(days=d.weekday())
@@ -417,7 +428,7 @@ def parse_strava_csv_basic(file_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source"])
 
     df = df_raw.copy()
-    df["start_dt"] = pd.to_datetime(df[c_date], errors="coerce")
+    df["start_dt"] = _to_naive_utc(df[c_date])
     df = df[df["start_dt"].notna()]
 
     def sport_from_type(v):
@@ -525,8 +536,8 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         # Si tenemos FIT/TCX/GPX y también CSV, podemos intentar rellenar sport faltante (other)
         csv_df = pd.concat(csv_frames, ignore_index=True)
         # emparejar por fecha cercana y distancia aproximada (heurística)
-        act_df["start_dt"] = pd.to_datetime(act_df["start_dt"], errors="coerce")
-        csv_df["start_dt"] = pd.to_datetime(csv_df["start_dt"], errors="coerce")
+        act_df["start_dt"] = _to_naive_utc(act_df["start_dt"])
+        csv_df["start_dt"] = _to_naive_utc(csv_df["start_dt"])
         for idx, row in act_df.iterrows():
             if str(row.get("sport")) != "other":
                 continue
@@ -546,7 +557,7 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         act_df = pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source","key","file"])
 
     # Normalizar
-    act_df["start_dt"] = pd.to_datetime(act_df.get("start_dt"), errors="coerce")
+    act_df["start_dt"] = _to_naive_utc(act_df.get("start_dt"))
     for c in ["distance_km","moving_min","avg_hr","avg_speed_mps"]:
         if c not in act_df.columns:
             act_df[c] = np.nan
