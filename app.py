@@ -499,8 +499,9 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         # Si tenemos FIT/TCX/GPX y también CSV, podemos intentar rellenar sport faltante (other)
         csv_df = pd.concat(csv_frames, ignore_index=True)
         # emparejar por fecha cercana y distancia aproximada (heurística)
-        act_df["start_dt"] = pd.to_datetime(act_df["start_dt"], errors="coerce")
-        csv_df["start_dt"] = pd.to_datetime(csv_df["start_dt"], errors="coerce")
+        # Normalizamos a datetime sin zona horaria para evitar comparaciones tz-aware vs tz-naive
+        act_df["start_dt"] = pd.to_datetime(act_df["start_dt"], errors="coerce", utc=True).dt.tz_convert(None)
+        csv_df["start_dt"] = pd.to_datetime(csv_df["start_dt"], errors="coerce", utc=True).dt.tz_convert(None)
         for idx, row in act_df.iterrows():
             if str(row.get("sport")) != "other":
                 continue
@@ -520,7 +521,7 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         act_df = pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source","key","file"])
 
     # Normalizar
-    act_df["start_dt"] = pd.to_datetime(act_df.get("start_dt"), errors="coerce")
+    act_df["start_dt"] = pd.to_datetime(act_df.get("start_dt"), errors="coerce", utc=True).dt.tz_convert(None)
     for c in ["distance_km","moving_min","avg_hr","avg_speed_mps"]:
         if c not in act_df.columns:
             act_df[c] = np.nan
