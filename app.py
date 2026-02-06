@@ -11,23 +11,17 @@ import pandas as pd
 import streamlit as st
 from dateutil import parser as dtparser
 
-# PRO parsers
 import gpxpy
 from fitparse import FitFile
 from lxml import etree
 
 # ============================================================
-# Planificador PRO
-# - Orientado a ZIP completos (Strava/Garmin/etc.)
-# - Si hay FIT/TCX dentro del ZIP, usa datos punto a punto (HR/ritmo/velocidad)
+# Planificador PRO (con funcionalidades del Universal)
+# - Acepta: CSV (Strava), GPX/TCX/FIT (Garmin/Komoot/otros), ZIP completo
+# - PRO: si hay FIT/TCX, usa datos punto a punto (HR/speed/distance)
 # ============================================================
 
-# -----------------------------
-# Tipos de actividad (para Strava CSV cuando exista)
-# -----------------------------
-RUN_TYPES = {
-    "run", "running", "carrera", "trail run", "treadmill", "virtual run",
-}
+RUN_TYPES = {"run", "running", "carrera", "trail run", "treadmill", "virtual run"}
 BIKE_TYPES = {
     "ride", "cycling", "bicicleta", "bike", "road", "road cycling", "mountain bike",
     "mtb", "gravel ride", "virtual ride", "e-bike ride", "ebike ride",
@@ -35,11 +29,12 @@ BIKE_TYPES = {
 
 GOALS = {
     "correr": [
-        ("maraton", "Maratón (en ~12 meses)"),
-        ("resistencia", "Mejorar resistencia y bajar pulsaciones"),
-        ("media", "Media maratón"),
-        ("10k", "10K"),
+        ("5k", "Carrera 5K"),
+        ("10k", "Carrera 10K"),
+        ("media", "Media maratón 21K"),
+        ("maraton", "Maratón 42K"),
         ("base", "Solo base aeróbica"),
+        ("resistencia", "Mejorar resistencia y bajar pulsaciones"),
     ],
     "bicicleta": [
         ("gran_fondo", "Gran fondo (larga distancia, en ~12 meses)"),
@@ -50,9 +45,6 @@ GOALS = {
     ],
 }
 
-# -----------------------------
-# Librerías (movilidad / core / fuerza)
-# -----------------------------
 MOBILITY_LIBRARY = {
     "movilidad_20": [
         "Caderas: 90/90 (2x60s por lado)",
@@ -139,7 +131,6 @@ def parse_time_to_minutes(val) -> Optional[float]:
     return safe_float(s)
 
 def estimate_hrmax(age: int) -> int:
-    # Estimación general; si conoces HRmáx real, mejor usarlo.
     return int(round(208 - 0.7 * age))
 
 def hr_zones(hrmax: int) -> Dict[str, Tuple[int, int]]:
@@ -158,38 +149,21 @@ def _to_datetime_safe(s) -> Optional[datetime]:
         return None
 
 def _to_naive_utc(s: pd.Series) -> pd.Series:
-    """Convierte a datetime UTC y devuelve naive (sin tz), evitando comparaciones tz-aware vs tz-naive."""
     dt = pd.to_datetime(s, errors="coerce", utc=True)
-    # tz_convert(None) deja naive en UTC
     try:
         return dt.dt.tz_convert(None)
     except Exception:
-        # si ya es naive
         return pd.to_datetime(dt, errors="coerce")
-
 
 def _week_start_monday(ts: pd.Timestamp) -> pd.Timestamp:
     d = ts.normalize()
     return d - pd.Timedelta(days=d.weekday())
 
-def _sec_diff_safe(a: pd.Timestamp, b: pd.Timestamp) -> float:
-    try:
-        return float((b - a).total_seconds())
-    except Exception:
-        return 0.0
-
 # ============================================================
-# Parser PRO: extrae series temporales cuando existen (FIT/TCX)
+# Parsers
 # ============================================================
 
 def _records_to_timeseries(records: List[dict]) -> pd.DataFrame:
-    """
-    Records list -> dataframe con columnas:
-      - timestamp (datetime)
-      - hr (bpm)
-      - speed_mps (m/s)
-      - distance_m (m)
-    """
     if not records:
         return pd.DataFrame(columns=["timestamp", "hr", "speed_mps", "distance_m"])
     df = pd.DataFrame(records)
@@ -204,73 +178,27 @@ def _records_to_timeseries(records: List[dict]) -> pd.DataFrame:
 def _summary_from_timeseries(ts: pd.DataFrame) -> dict:
     if ts.empty:
         return {"moving_s": None, "distance_m": None, "avg_hr": None, "avg_speed_mps": None}
-
-    # Duración por diffs (ignorando gaps enormes)
     dt = ts["timestamp"].diff().dt.total_seconds()
-    dt = dt.where((dt.notna()) & (dt >= 0) & (dt <= 60), 0)  # cap gaps
+    dt = dt.where((dt.notna()) & (dt >= 0) & (dt <= 60), 0)
     moving_s = float(dt.sum())
 
     distance_m = None
     if ts["distance_m"].notna().any():
-        # distancia total como último - primero
         d0 = float(ts["distance_m"].dropna().iloc[0])
         d1 = float(ts["distance_m"].dropna().iloc[-1])
         distance_m = max(0.0, d1 - d0)
     elif ts["speed_mps"].notna().any():
-        # aproximación integrando velocidad
         distance_m = float((ts["speed_mps"].fillna(0) * dt.fillna(0)).sum())
 
     avg_hr = float(ts["hr"].dropna().mean()) if ts["hr"].notna().any() else None
     avg_speed = float(ts["speed_mps"].dropna().mean()) if ts["speed_mps"].notna().any() else None
-
     return {"moving_s": moving_s, "distance_m": distance_m, "avg_hr": avg_hr, "avg_speed_mps": avg_speed}
 
-def _zone_seconds(ts: pd.DataFrame, hrmax: int) -> Dict[str, float]:
-    z = hr_zones(hrmax)
-    out = {k: 0.0 for k in z.keys()}
-
-    if ts.empty or ts["hr"].notna().sum() < 10:
-        return out
-
-    df = ts.copy()
-    df["dt"] = df["timestamp"].diff().dt.total_seconds()
-    df["dt"] = df["dt"].where((df["dt"].notna()) & (df["dt"] >= 0) & (df["dt"] <= 60), 0)
-    hr = df["hr"]
-
-    for zone, (lo, hi) in z.items():
-        mask = hr.ge(lo) & hr.lt(hi)
-        out[zone] = float(df.loc[mask, "dt"].sum())
-
-    return out
-
-def _hr_drift(ts: pd.DataFrame) -> Optional[float]:
-    """
-    Deriva cardiaca simple: (HR 2ª mitad - HR 1ª mitad) / HR 1ª mitad
-    solo si hay suficientes puntos.
-    """
-    if ts.empty or ts["hr"].notna().sum() < 60:
-        return None
-    df = ts.dropna(subset=["hr"]).copy()
-    if df.shape[0] < 60:
-        return None
-    mid = df.shape[0] // 2
-    hr1 = float(df.iloc[:mid]["hr"].mean())
-    hr2 = float(df.iloc[mid:]["hr"].mean())
-    if hr1 <= 0:
-        return None
-    return (hr2 - hr1) / hr1
-
 def parse_fit_pro(file_bytes: bytes) -> Tuple[dict, pd.DataFrame]:
-    """
-    Devuelve:
-      - summary dict con start_dt, sport, distance_km, moving_min, avg_hr, avg_speed_mps, source
-      - timeseries df (timestamp/hr/speed_mps/distance_m)
-    """
     fitfile = FitFile(BytesIO(file_bytes))
-
-    # 1) sport/start via session si existe
     sport = "other"
     start_dt = None
+
     sessions = list(fitfile.get_messages("session"))
     if sessions:
         s = sessions[0]
@@ -282,36 +210,23 @@ def parse_fit_pro(file_bytes: bytes) -> Tuple[dict, pd.DataFrame]:
         elif "cycling" in sport_raw or "bike" in sport_raw:
             sport = "ride"
 
-    # 2) records para series
     recs = []
     for r in fitfile.get_messages("record"):
         fields = {f.name: f.value for f in r}
         ts = fields.get("timestamp")
         if ts is None:
             continue
-        recs.append(
-            {
-                "timestamp": ts,
-                "hr": fields.get("heart_rate"),
-                "speed_mps": fields.get("speed"),
-                "distance_m": fields.get("distance"),
-            }
-        )
+        recs.append({"timestamp": ts, "hr": fields.get("heart_rate"), "speed_mps": fields.get("speed"), "distance_m": fields.get("distance")})
     ts_df = _records_to_timeseries(recs)
-
     summ2 = _summary_from_timeseries(ts_df)
-    distance_km = (summ2["distance_m"] / 1000.0) if summ2["distance_m"] is not None else None
-    moving_min = (summ2["moving_s"] / 60.0) if summ2["moving_s"] is not None else None
-
-    # start_dt fallback: primer timestamp
     if start_dt is None and not ts_df.empty:
         start_dt = ts_df["timestamp"].iloc[0]
 
     summary = {
         "start_dt": start_dt,
         "sport": sport,
-        "distance_km": distance_km,
-        "moving_min": moving_min,
+        "distance_km": (summ2["distance_m"] / 1000.0) if summ2["distance_m"] is not None else None,
+        "moving_min": (summ2["moving_s"] / 60.0) if summ2["moving_s"] is not None else None,
         "avg_hr": summ2["avg_hr"],
         "avg_speed_mps": summ2["avg_speed_mps"],
         "source": "fit_pro",
@@ -319,9 +234,6 @@ def parse_fit_pro(file_bytes: bytes) -> Tuple[dict, pd.DataFrame]:
     return summary, ts_df
 
 def parse_tcx_pro(file_bytes: bytes) -> Tuple[dict, pd.DataFrame]:
-    """
-    TCX: extrae Trackpoints con Time/HR/Speed/DistanceMeters cuando existen.
-    """
     root = etree.parse(BytesIO(file_bytes))
     activities = root.xpath("//*[local-name()='Activity']")
     if not activities:
@@ -329,11 +241,11 @@ def parse_tcx_pro(file_bytes: bytes) -> Tuple[dict, pd.DataFrame]:
             {"start_dt": None, "sport": "other", "distance_km": None, "moving_min": None, "avg_hr": None, "avg_speed_mps": None, "source": "tcx_pro"},
             pd.DataFrame(columns=["timestamp", "hr", "speed_mps", "distance_m"]),
         )
+
     act = activities[0]
     sport_attr = (act.get("Sport") or "").lower()
     sport = "run" if "run" in sport_attr else "ride" if ("bike" in sport_attr or "cycle" in sport_attr) else "other"
 
-    # Trackpoints
     tps = act.xpath(".//*[local-name()='Trackpoint']")
     recs = []
     for tp in tps:
@@ -378,7 +290,6 @@ def parse_tcx_pro(file_bytes: bytes) -> Tuple[dict, pd.DataFrame]:
 
 def parse_gpx_basic(file_bytes: bytes) -> dict:
     gpx = gpxpy.parse(BytesIO(file_bytes))
-    # GPX suele no incluir HR/Speed de forma estándar => resumen simple
     total_dist_m = 0.0
     start_dt = None
     end_dt = None
@@ -409,17 +320,17 @@ def parse_gpx_basic(file_bytes: bytes) -> dict:
     }
 
 def parse_strava_csv_basic(file_bytes: bytes) -> pd.DataFrame:
-    # Compatibilidad: si en el ZIP viene activities.csv lo leemos para deporte y resumen.
     df_raw = pd.read_csv(BytesIO(file_bytes))
     cols = {c.strip().lower(): c for c in df_raw.columns}
-    # nombres típicos
+
     def pick(*names):
         for n in names:
             if n in cols:
                 return cols[n]
         return None
+
     c_type = pick("activity type", "type")
-    c_date = pick("activity date", "date", "start date")
+    c_date = pick("activity date", "date", "start date", "start_time", "start time")
     c_dist = pick("distance")
     c_move = pick("moving time", "moving_time", "duration", "elapsed time")
     c_hr = pick("average heart rate", "avg heart rate", "avg_hr")
@@ -449,13 +360,8 @@ def parse_strava_csv_basic(file_bytes: bytes) -> pd.DataFrame:
     return df[["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source"]]
 
 def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    """
-    Lee ZIP y devuelve:
-      - activities_df (resumen por actividad)
-      - timeseries_by_key dict: key -> timeseries df (para FIT/TCX)
-    """
     z = zipfile.ZipFile(BytesIO(file_bytes))
-    # Conteo por extensión (debug)
+
     file_counts = {"fit":0,"fit.gz":0,"tcx":0,"tcx.gz":0,"gpx":0,"gpx.gz":0,"csv":0}
     for n in z.namelist():
         ln = n.lower()
@@ -469,8 +375,6 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
 
     activities: List[dict] = []
     ts_map: Dict[str, pd.DataFrame] = {}
-
-    # Si hay activities.csv, lo guardamos para fallback de deporte/fecha
     csv_frames = []
 
     for name in z.namelist():
@@ -480,23 +384,19 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
         except Exception:
             continue
 
-        # Descomprimir si viene como .gz (muy habitual en export de Strava)
         data = raw
         if lname.endswith(".gz"):
             try:
                 data = gzip.decompress(raw)
             except Exception:
-                # si no es un gzip válido, seguimos con el raw
                 data = raw
 
-        # activities.csv dentro del ZIP (fallback)
         if lname.endswith("activities.csv") or lname.endswith("activity.csv"):
             try:
                 csv_frames.append(parse_strava_csv_basic(data))
             except Exception:
                 pass
 
-        # FIT / TCX / GPX (normal o .gz)
         if lname.endswith(".fit") or lname.endswith(".fit.gz"):
             try:
                 summ, ts = parse_fit_pro(data)
@@ -525,26 +425,24 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
             except Exception:
                 continue
 
-
     act_df = pd.DataFrame(activities)
+
     if act_df.empty and csv_frames:
-        # Solo CSV
         act_df = pd.concat(csv_frames, ignore_index=True)
         act_df["key"] = act_df.index.astype(str)
         act_df["file"] = "activities.csv"
-    elif not act_df.empty and csv_frames:
-        # Si tenemos FIT/TCX/GPX y también CSV, podemos intentar rellenar sport faltante (other)
+    elif (not act_df.empty) and csv_frames:
         csv_df = pd.concat(csv_frames, ignore_index=True)
-        # emparejar por fecha cercana y distancia aproximada (heurística)
-        act_df["start_dt"] = _to_naive_utc(act_df["start_dt"])
+        act_df["start_dt"] = _to_naive_utc(act_df.get("start_dt"))
         csv_df["start_dt"] = _to_naive_utc(csv_df["start_dt"])
+
         for idx, row in act_df.iterrows():
             if str(row.get("sport")) != "other":
                 continue
             if pd.isna(row.get("start_dt")) or pd.isna(row.get("distance_km")):
                 continue
             window = csv_df[
-                (csv_df["start_dt"].between(row["start_dt"] - pd.Timedelta(hours=6), row["start_dt"] + pd.Timedelta(hours=6)))
+                csv_df["start_dt"].between(row["start_dt"] - pd.Timedelta(hours=6), row["start_dt"] + pd.Timedelta(hours=6))
             ].copy()
             if window.empty:
                 continue
@@ -556,7 +454,6 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
     if act_df.empty:
         act_df = pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source","key","file"])
 
-    # Normalizar
     act_df["start_dt"] = _to_naive_utc(act_df.get("start_dt"))
     for c in ["distance_km","moving_min","avg_hr","avg_speed_mps"]:
         if c not in act_df.columns:
@@ -566,14 +463,77 @@ def parse_zip_pro(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, pd.DataFra
     act_df.attrs["file_counts"] = file_counts
     return act_df, ts_map
 
+def parse_any_upload_pro(uploaded_file) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    b = uploaded_file.getvalue()
+    name = (uploaded_file.name or "").lower()
+
+    if name.endswith(".zip"):
+        return parse_zip_pro(b)
+
+    if name.endswith(".fit"):
+        summ, ts = parse_fit_pro(b)
+        df = pd.DataFrame([{**summ, "key": name, "file": name}])
+        df["start_dt"] = _to_naive_utc(df["start_dt"])
+        return df, ({name: ts} if ts is not None and not ts.empty else {})
+
+    if name.endswith(".tcx"):
+        summ, ts = parse_tcx_pro(b)
+        df = pd.DataFrame([{**summ, "key": name, "file": name}])
+        df["start_dt"] = _to_naive_utc(df["start_dt"])
+        return df, ({name: ts} if ts is not None and not ts.empty else {})
+
+    if name.endswith(".gpx"):
+        summ = parse_gpx_basic(b)
+        df = pd.DataFrame([{**summ, "key": name, "file": name}])
+        df["start_dt"] = _to_naive_utc(df["start_dt"])
+        return df, {}
+
+    if name.endswith(".csv"):
+        df = parse_strava_csv_basic(b)
+        if df.empty:
+            return pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source","key","file"]), {}
+        df = df.copy()
+        df["key"] = df.index.astype(str)
+        df["file"] = "activities.csv"
+        df["start_dt"] = _to_naive_utc(df["start_dt"])
+        return df, {}
+
+    return pd.DataFrame(columns=["start_dt","sport","distance_km","moving_min","avg_hr","avg_speed_mps","source","key","file"]), {}
+
 # ============================================================
-# Métricas PRO semanales
+# Métricas / feedback
 # ============================================================
 
+def _zone_seconds(ts: pd.DataFrame, hrmax: int) -> Dict[str, float]:
+    z = hr_zones(hrmax)
+    out = {k: 0.0 for k in z.keys()}
+    if ts is None or ts.empty or ts["hr"].notna().sum() < 10:
+        return out
+
+    df = ts.copy()
+    df["dt"] = df["timestamp"].diff().dt.total_seconds()
+    df["dt"] = df["dt"].where((df["dt"].notna()) & (df["dt"] >= 0) & (df["dt"] <= 60), 0)
+    hr = df["hr"]
+
+    for zone, (lo, hi) in z.items():
+        mask = hr.ge(lo) & hr.lt(hi)
+        out[zone] = float(df.loc[mask, "dt"].sum())
+    return out
+
+def _hr_drift(ts: pd.DataFrame) -> Optional[float]:
+    if ts is None or ts.empty or ts["hr"].notna().sum() < 60:
+        return None
+    df = ts.dropna(subset=["hr"]).copy()
+    if df.shape[0] < 60:
+        return None
+    mid = df.shape[0] // 2
+    hr1 = float(df.iloc[:mid]["hr"].mean())
+    hr2 = float(df.iloc[mid:]["hr"].mean())
+    if hr1 <= 0:
+        return None
+    return (hr2 - hr1) / hr1
+
 def weekly_zone_distribution(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataFrame], hrmax: int) -> pd.DataFrame:
-    """
-    Devuelve un df por semana con segundos en Z1..Z5 y % sobre total con HR.
-    """
     if target_df.empty:
         return pd.DataFrame(columns=["week_start","Z1_s","Z2_s","Z3_s","Z4_s","Z5_s","hr_seconds"])
 
@@ -598,10 +558,6 @@ def weekly_zone_distribution(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataF
     return g
 
 def weekly_baseline_simple(target_df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Similar a tu baseline anterior, pero sin renombrados raros.
-    target_df: start_dt + distance_km
-    """
     if target_df.empty:
         return {"w_km": 0.0, "long_km": 0.0, "sessions_w": 0.0}
 
@@ -621,16 +577,104 @@ def weekly_baseline_simple(target_df: pd.DataFrame) -> Dict[str, float]:
     w_km = float(w.mean()) if len(w) else 0.0
     sessions_w = float(sw.mean()) if len(sw) else 0.0
     long_km = float(df["distance_km"].max()) if df["distance_km"].notna().any() else 0.0
-
     return {"w_km": w_km, "long_km": long_km, "sessions_w": sessions_w}
 
+def make_weekly_feedback_basic(target_df: pd.DataFrame, modality: str, hrmax: int) -> str:
+    if target_df.empty or target_df["start_dt"].isna().all():
+        return "No hay datos suficientes para generar feedback semanal."
+
+    df = target_df.copy()
+    df["start_dt"] = pd.to_datetime(df["start_dt"], errors="coerce")
+    df = df[df["start_dt"].notna()].sort_values("start_dt")
+    if df.empty:
+        return "No hay datos suficientes para generar feedback semanal."
+
+    df["week_start"] = df["start_dt"].apply(_week_start_monday)
+    today = pd.Timestamp(date.today())
+    this_week_start = _week_start_monday(today)
+    complete_weeks = df[df["week_start"] < this_week_start]
+
+    if complete_weeks.empty:
+        window_start = today - pd.Timedelta(days=7)
+        w = df[df["start_dt"] >= window_start]
+        label = f"Últimos 7 días (desde {window_start.date()} hasta {today.date()})"
+    else:
+        last_week = complete_weeks["week_start"].max()
+        w = df[df["week_start"] == last_week]
+        label = f"Semana (lunes-domingo) desde {last_week.date()}"
+
+    km = float(w["distance_km"].fillna(0).sum())
+    sessions = int(w.shape[0])
+    long_km = float(w["distance_km"].fillna(0).max()) if sessions else 0.0
+    minutes = float(w["moving_min"].fillna(0).sum()) if "moving_min" in w.columns else 0.0
+
+    avg_hr = None
+    if "avg_hr" in w.columns and w["avg_hr"].notna().any():
+        avg_hr = float(w["avg_hr"].dropna().mean())
+
+    good, warn, actions = [], [], []
+    if sessions >= 4:
+        good.append("Buena consistencia: 4 o más sesiones.")
+    elif sessions >= 3:
+        good.append("Consistencia correcta: 3 sesiones.")
+    else:
+        warn.append("Poca consistencia esta semana. Si puedes, intenta 3–4 sesiones.")
+
+    if modality == "correr":
+        if long_km >= 18:
+            good.append("Tirada larga sólida para construir resistencia.")
+        elif long_km >= 12:
+            good.append("Tirada larga correcta para tu base actual.")
+        else:
+            actions.append("Incluye una tirada larga suave (Z2) semanal y súbela poco a poco.")
+    else:
+        if long_km >= 80:
+            good.append("Salida larga sólida para base ciclista.")
+        elif long_km >= 50:
+            good.append("Salida larga correcta para tu base actual.")
+        else:
+            actions.append("Incluye una salida larga Z2 y practica hidratación/comida.")
+
+    if avg_hr is not None:
+        z = hr_zones(hrmax)
+        if avg_hr >= z["Z3"][0]:
+            warn.append("La FC media de la semana es alta para construir base. Puede que estés yendo demasiado fuerte.")
+            actions.append("Haz rodajes en Z2 y deja la intensidad para 1 día (tempo/intervalos).")
+        else:
+            good.append("FC media compatible con trabajo aeróbico (base).")
+
+    if not actions:
+        actions = [
+            "Mantén 1 sesión de calidad (tempo/intervalos) y el resto fácil.",
+            "Asegura 1–2 sesiones de fuerza + core (20–35').",
+            "Prioriza sueño e hidratación.",
+        ]
+
+    txt = f"""### Feedback semanal
+
+**Periodo analizado:** {label}  
+**Hechos:** {sessions} sesiones · {km:.1f} km · {minutes:.0f} min · sesión más larga {long_km:.1f} km"""
+    if avg_hr is not None:
+        txt += f" · FC media aprox {avg_hr:.0f} ppm\n"
+    else:
+        txt += "\n"
+
+    if good:
+        txt += "\n**Lo que va bien**\n"
+        for g in good:
+            txt += f"- {g}\n"
+
+    if warn:
+        txt += "\n**Ajustes o alertas**\n"
+        for w0 in warn:
+            txt += f"- {w0}\n"
+
+    txt += "\n**Próximos pasos (1–3)**\n"
+    for i, a in enumerate(actions[:3], start=1):
+        txt += f"{i}. {a}\n"
+    return txt
+
 def make_weekly_feedback_pro(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataFrame], modality: str, hrmax: int) -> str:
-    """
-    Feedback PRO:
-    - volumen, sesiones, larga
-    - distribución de zonas (si hay HR)
-    - deriva cardiaca de la sesión larga (si hay HR)
-    """
     if target_df.empty or target_df["start_dt"].isna().all():
         return "No hay datos suficientes para generar feedback."
 
@@ -655,13 +699,13 @@ def make_weekly_feedback_pro(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataF
 
     km = float(w["distance_km"].fillna(0).sum())
     sessions = int(w.shape[0])
+
     long_idx = w["distance_km"].fillna(0).idxmax() if sessions else None
     long_row = w.loc[long_idx] if long_idx is not None else None
     long_km = float(long_row["distance_km"]) if long_row is not None else 0.0
 
     minutes = float(w["moving_min"].fillna(0).sum()) if "moving_min" in w.columns else 0.0
 
-    # Zonas para esa semana
     z_week = weekly_zone_distribution(w, ts_map, hrmax)
     z_line = ""
     z_warn = ""
@@ -672,11 +716,9 @@ def make_weekly_feedback_pro(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataF
         z4 = last.get("Z4_pct")
         if pd.notna(z2):
             z_line = f"**Distribución de zonas (con HR):** Z2 {z2*100:.0f}% · Z3 {z3*100:.0f}% · Z4 {z4*100:.0f}%"
-            # alerta simple: demasiado Z3+Z4
             if (z3 + z4) > 0.45:
                 z_warn = "Estás pasando mucho tiempo en Z3–Z4. Si tu objetivo es base/resistencia, prueba a mover más tiempo a Z2."
 
-    # Deriva de la sesión larga
     drift_line = ""
     drift = None
     if long_row is not None:
@@ -686,7 +728,6 @@ def make_weekly_feedback_pro(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataF
             if drift is not None:
                 drift_line = f"**Deriva cardiaca (sesión larga):** {drift*100:.1f}% (ideal: baja; si es alta, baja ritmo o mejora recuperación)"
 
-    # Próximos pasos
     actions = []
     if sessions < 3:
         actions.append("Intenta llegar a 3 sesiones esta semana (aunque alguna sea corta y muy suave).")
@@ -724,7 +765,7 @@ def make_weekly_feedback_pro(target_df: pd.DataFrame, ts_map: Dict[str, pd.DataF
     return txt
 
 # ============================================================
-# Generación del plan (igual que tu versión anterior)
+# Plan anual (1–7 días)
 # ============================================================
 
 @dataclass
@@ -734,7 +775,7 @@ class UserProfile:
     weight_kg: float
     days_per_week: int
     goal: str
-    modality: str  # "correr" o "bicicleta"
+    modality: str
     start_date: date
 
 def phase_for_week(week_idx: int) -> str:
@@ -797,17 +838,33 @@ def workout_templates(phase: str, goal: str, hrmax: int, modality: str) -> Dict[
     }
 
 def distribute_week_km(total_km: float, long_km: float, days: int) -> List[float]:
-    days = max(3, int(days))
-    remain = max(0.0, total_km - long_km)
-    if days == 3:
-        parts = [remain * 0.45, remain * 0.55]
-    elif days == 4:
-        parts = [remain * 0.25, remain * 0.30, remain * 0.45]
-    elif days == 5:
-        parts = [remain * 0.18, remain * 0.20, remain * 0.25, remain * 0.37]
+    days = int(days)
+    days = max(1, min(7, days))
+    if days == 1:
+        return [round(max(total_km, long_km), 1)]
+
+    long_km = min(long_km, total_km) if total_km and total_km > 0 else long_km
+    remain = max(0.0, (total_km or 0.0) - (long_km or 0.0))
+
+    n = days - 1
+    if n == 1:
+        weights = [1.0]
+    elif n == 2:
+        weights = [0.45, 0.55]
+    elif n == 3:
+        weights = [0.25, 0.30, 0.45]
+    elif n == 4:
+        weights = [0.18, 0.20, 0.25, 0.37]
+    elif n == 5:
+        weights = [0.12, 0.15, 0.18, 0.20, 0.35]
     else:
-        parts = [remain * 0.12, remain * 0.15, remain * 0.18, remain * 0.20, remain * 0.35]
-    return [round(x, 1) for x in parts] + [round(long_km, 1)]
+        weights = [0.10, 0.12, 0.14, 0.16, 0.18, 0.30]
+
+    sess = [round(remain * w, 1) for w in weights] + [round(long_km or 0.0, 1)]
+    diff = round((total_km or 0.0) - sum(sess), 1)
+    if abs(diff) >= 0.1 and len(sess) >= 2:
+        sess[0] = round(max(0.0, sess[0] + diff), 1)
+    return sess
 
 def build_plan(profile: UserProfile, baseline: Dict[str, float], hrmax: int) -> pd.DataFrame:
     start = next_monday(profile.start_date)
@@ -819,45 +876,61 @@ def build_plan(profile: UserProfile, baseline: Dict[str, float], hrmax: int) -> 
         if l_km > 0.45 * w_km:
             w_km = round(l_km / 0.45, 1)
 
-        km_sessions = distribute_week_km(w_km, l_km, profile.days_per_week)
         templates = workout_templates(phase, profile.goal, hrmax, profile.modality)
         week_start = start + timedelta(weeks=w - 1)
 
-        if profile.days_per_week >= 6:
-            dmap = {
-                0: ("easy", km_sessions[0]),
-                1: ("intervals" if phase in ("Construcción", "Específico") else "progressive", km_sessions[1]),
-                2: ("easy", km_sessions[2]),
-                3: ("tempo" if phase != "Base" else "progressive", km_sessions[3]),
-                4: ("recovery", max(4.0, km_sessions[4])),
-                5: ("easy", km_sessions[5] if len(km_sessions) > 5 else max(6.0, (w_km - l_km) * 0.2)),
-                6: ("long", km_sessions[-1]),
-            }
+        dmap = {}
+        strength_days = []
+
+        quality1 = "intervals" if phase in ("Construcción", "Específico") else "progressive"
+        quality2 = "tempo" if phase != "Base" else "progressive"
+        dpw = int(profile.days_per_week)
+
+        if dpw == 7:
+            train_days = [0, 1, 2, 3, 4, 5, 6]
+        elif dpw == 6:
+            train_days = [0, 1, 2, 3, 5, 6]
+        elif dpw == 5:
+            train_days = [0, 1, 3, 5, 6]
+        elif dpw == 4:
+            train_days = [1, 3, 5, 6]
+        elif dpw == 3:
+            train_days = [1, 3, 6]
+        elif dpw == 2:
+            train_days = [3, 6]
+        else:
+            train_days = [6]
+
+        km_sessions = distribute_week_km(w_km, l_km, dpw)
+
+        if dpw == 1:
+            types = ["long"]
+        elif dpw == 2:
+            types = ["easy", "long"]
+        elif dpw == 3:
+            types = [quality1, "easy", "long"]
+        elif dpw == 4:
+            types = [quality1, "easy", quality2, "long"]
+        elif dpw == 5:
+            types = ["easy", quality1, quality2, "easy", "long"]
+        elif dpw == 6:
+            types = ["easy", quality1, "easy", quality2, "easy", "long"]
+        else:
+            types = ["easy", quality1, "easy", quality2, "recovery", "easy", "long"]
+
+        for idx, dow in enumerate(train_days):
+            dmap[dow] = (types[idx], km_sessions[idx] if idx < len(km_sessions) else 0.0)
+
+        if dpw >= 5:
             strength_days = [2, 4]
-        elif profile.days_per_week == 5:
-            dmap = {
-                0: ("easy", km_sessions[0]),
-                1: ("intervals" if phase in ("Construcción", "Específico") else "progressive", km_sessions[1]),
-                3: ("tempo" if phase != "Base" else "progressive", km_sessions[2]),
-                5: ("easy", km_sessions[3]),
-                6: ("long", km_sessions[-1]),
-            }
-            strength_days = [2, 4]
-        elif profile.days_per_week == 4:
-            dmap = {
-                1: ("intervals" if phase in ("Construcción", "Específico") else "progressive", km_sessions[0]),
-                3: ("easy", km_sessions[1]),
-                5: ("tempo" if phase != "Base" else "progressive", km_sessions[2]),
-                6: ("long", km_sessions[-1]),
-            }
+        elif dpw == 4:
+            strength_days = [0, 2]
+        elif dpw == 3:
+            strength_days = [0, 4]
+        elif dpw == 2:
             strength_days = [0, 2]
         else:
-            dmap = {
-                1: ("intervals" if phase in ("Construcción", "Específico") else "progressive", km_sessions[0]),
-                3: ("easy", km_sessions[1]),
-                6: ("long", km_sessions[-1]),
-            }
-            strength_days = [0, 4]
+            strength_days = [2]
 
         for dow in range(7):
             this_day = week_start + timedelta(days=dow)
@@ -874,43 +947,19 @@ def build_plan(profile: UserProfile, baseline: Dict[str, float], hrmax: int) -> 
                     extra = (extra + " | " if extra else "") + "Core 10': " + "; ".join(CORE_LIBRARY["core_10"])
 
                 rows.append(
-                    {
-                        "Fecha": this_day,
-                        "Día": day_name,
-                        "Modalidad": modality_name,
-                        "Fase": phase,
-                        "Sesión": t["title"],
-                        "Volumen (km)": float(km),
-                        "Detalles": t["details"] + ((" | " + extra) if extra else ""),
-                    }
+                    {"Fecha": this_day, "Día": day_name, "Modalidad": modality_name, "Fase": phase, "Sesión": t["title"], "Volumen (km)": float(km),
+                     "Detalles": t["details"] + ((" | " + extra) if extra else "")}
                 )
             elif dow in strength_days:
                 strength_key = "fuerza_35" if phase in ("Construcción", "Específico") else "fuerza_25"
                 rows.append(
-                    {
-                        "Fecha": this_day,
-                        "Día": day_name,
-                        "Modalidad": modality_name,
-                        "Fase": phase,
-                        "Sesión": "Fuerza + core",
-                        "Volumen (km)": 0.0,
-                        "Detalles": "Fuerza: "
-                        + "; ".join(STRENGTH_LIBRARY[strength_key])
-                        + " | Core: "
-                        + "; ".join(CORE_LIBRARY["core_20"]),
-                    }
+                    {"Fecha": this_day, "Día": day_name, "Modalidad": modality_name, "Fase": phase, "Sesión": "Fuerza + core", "Volumen (km)": 0.0,
+                     "Detalles": "Fuerza: " + "; ".join(STRENGTH_LIBRARY[strength_key]) + " | Core: " + "; ".join(CORE_LIBRARY["core_20"])}
                 )
             else:
                 rows.append(
-                    {
-                        "Fecha": this_day,
-                        "Día": day_name,
-                        "Modalidad": modality_name,
-                        "Fase": phase,
-                        "Sesión": "Descanso / movilidad",
-                        "Volumen (km)": 0.0,
-                        "Detalles": "Movilidad 20': " + "; ".join(MOBILITY_LIBRARY["movilidad_20"]),
-                    }
+                    {"Fecha": this_day, "Día": day_name, "Modalidad": modality_name, "Fase": phase, "Sesión": "Descanso / movilidad", "Volumen (km)": 0.0,
+                     "Detalles": "Movilidad 20': " + "; ".join(MOBILITY_LIBRARY["movilidad_20"])}
                 )
 
     return pd.DataFrame(rows)
@@ -923,19 +972,16 @@ def plan_to_excel_bytes(plan: pd.DataFrame) -> bytes:
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for (y, m), chunk in plan.groupby(["Año", "Mes"], sort=True):
+        for (_, _), chunk in plan.groupby(["Año", "Mes"], sort=True):
             month_name = chunk["Fecha"].dt.strftime("%B").iloc[0]
             sheet_name = f"{month_name[:28]}"
-            chunk = chunk.sort_values("Fecha")[
-                ["Fecha", "Día", "Modalidad", "Fase", "Sesión", "Volumen (km)", "Detalles"]
-            ]
+            chunk = chunk.sort_values("Fecha")[["Fecha", "Día", "Modalidad", "Fase", "Sesión", "Volumen (km)", "Detalles"]]
             chunk.to_excel(writer, index=False, sheet_name=sheet_name)
             ws = writer.book[sheet_name]
             ws.freeze_panes = "A2"
             widths = [12, 12, 12, 14, 22, 12, 80]
             for i, w in enumerate(widths, start=1):
                 ws.column_dimensions[chr(64 + i)].width = w
-
     return output.getvalue()
 
 # ============================================================
@@ -943,12 +989,23 @@ def plan_to_excel_bytes(plan: pd.DataFrame) -> bytes:
 # ============================================================
 
 st.set_page_config(page_title="Planificador PRO", layout="wide")
-st.title("Planificador PRO (ZIP completo con datos detallados)")
-st.info("Sube el ZIP completo (Strava / Garmin / otros). Si dentro hay FIT/TCX, usaré pulsaciones y ritmo/velocidad en el análisis semanal.")
+st.title("Planificador PRO (con lectura multi-plataforma)")
+st.info("Sube tus actividades (CSV de Strava, GPX/TCX/FIT o ZIP completo). Si hay FIT/TCX, se usarán datos detallados para el feedback PRO.")
+
+with st.expander("Cómo descargar el CSV en Strava"):
+    st.markdown(
+        """
+1. Inicia sesión en Strava desde un ordenador y haz clic en tu foto de perfil. Selecciona **Ajustes**.  
+2. En el menú lateral izquierdo, entra en **Mi cuenta**.  
+3. Accede a **Descarga o elimina tu cuenta** y pulsa en **Solicita tu archivo**.  
+4. Strava te enviará un correo con un archivo .zip. Descárgalo y descomprímelo.  
+5. **Solo necesitas el archivo `activities.csv`** (o puedes subir el ZIP completo).
+"""
+    )
 
 uploaded = st.file_uploader(
-    "Sube tu ZIP completo (recomendado)",
-    type=["zip"],
+    "Sube un archivo: CSV (Strava), GPX/TCX/FIT (Garmin/Komoot/otros) o ZIP (export completo)",
+    type=["csv", "gpx", "tcx", "fit", "zip"],
 )
 
 with st.sidebar:
@@ -961,44 +1018,43 @@ with st.sidebar:
     weight_kg = st.number_input("Peso (kg)", min_value=35.0, max_value=200.0, value=80.0, step=0.5)
 
     st.header("Objetivo")
-    goal = st.selectbox(
-        "Selecciona objetivo principal",
-        options=GOALS[modality],
-        format_func=lambda x: x[1],
-    )[0]
+    goal = st.selectbox("Selecciona objetivo principal", options=GOALS[modality], format_func=lambda x: x[1])[0]
 
-    days_per_week = st.slider("Días de entrenamiento por semana", min_value=3, max_value=6, value=5)
+    days_per_week = st.slider("Días de entrenamiento por semana", min_value=1, max_value=7, value=5)
     start_date = st.date_input("Fecha de inicio", value=date.today())
 
 if uploaded is None:
     st.stop()
 
-# Parse ZIP PRO
-activities_df, ts_map = parse_zip_pro(uploaded.getvalue())
+activities_df, ts_map = parse_any_upload_pro(uploaded)
+
 file_counts = getattr(activities_df, "attrs", {}).get("file_counts", None)
 if file_counts:
     with st.expander("Qué tipos de archivos he encontrado dentro del ZIP"):
         st.write(file_counts)
-        st.caption("Si Strava exporta .fit.gz/.tcx.gz, ahora también los procesamos.")
+
 if activities_df.empty:
-    st.error("No he podido leer actividades del ZIP. Prueba con un ZIP que contenga FIT/TCX/GPX o activities.csv.")
+    st.error("No he podido leer actividades del archivo. Prueba con CSV de Strava, GPX/TCX/FIT o ZIP con actividades.")
     st.stop()
 
-# Filtrar por modalidad
 sport_needed = "run" if modality == "correr" else "ride"
 target = activities_df[activities_df["sport"] == sport_needed].copy()
 
-# Si no hay deporte (todo other), permite asignar
 if target.empty and (activities_df["sport"] == "other").any():
-    st.warning("No he podido identificar correr/bici en tus archivos (típico si solo hay GPX). Puedes asignarlo.")
-    assign_all = st.selectbox("Asigna las actividades como:", options=["correr", "bicicleta"])
-    activities_df.loc[activities_df["sport"] == "other", "sport"] = "run" if assign_all == "correr" else "ride"
-    target = activities_df[activities_df["sport"] == sport_needed].copy()
+    with st.expander("Clasificación de actividades sin deporte (solo si hace falta)"):
+        st.write("Algunos formatos (como GPX) no indican si es correr o bici. Puedes asignarlo aquí.")
+        assign_other = st.selectbox("Asignar actividades 'other' como:", options=["no cambiar", "correr", "bicicleta"], index=0)
+        if assign_other != "no cambiar":
+            activities_df.loc[activities_df["sport"] == "other", "sport"] = "run" if assign_other == "correr" else "ride"
+            target = activities_df[activities_df["sport"] == sport_needed].copy()
+
+if target.empty:
+    st.warning("No he encontrado actividades de la modalidad seleccionada (o falta clasificación si has subido GPX).")
 
 hrmax = estimate_hrmax(int(age))
 baseline = weekly_baseline_simple(target) if not target.empty else {"w_km": 0.0, "long_km": 0.0, "sessions_w": 0.0}
 
-st.subheader("Lectura rápida del ZIP")
+st.subheader("Lectura rápida de tus datos")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Actividades detectadas (modalidad)", int(target.shape[0]))
 c2.metric("Km/semana (media ~6 semanas)", f"{baseline['w_km']:.1f}")
@@ -1010,11 +1066,16 @@ with st.expander("Ver tabla de actividades detectadas"):
     show["start_dt"] = pd.to_datetime(show["start_dt"], errors="coerce")
     show = show.sort_values("start_dt", ascending=False)
     cols = ["start_dt", "distance_km", "moving_min", "avg_hr", "source", "file"]
+    cols = [c for c in cols if c in show.columns]
     st.dataframe(show[cols].head(200), use_container_width=True)
 
-st.subheader("Feedback PRO")
-if st.button("Generar feedback semanal PRO"):
-    st.markdown(make_weekly_feedback_pro(target, ts_map, modality, hrmax))
+st.subheader("Feedback")
+has_pro_signal = len(ts_map) > 0
+if st.button("Generar feedback semanal"):
+    if has_pro_signal:
+        st.markdown(make_weekly_feedback_pro(target, ts_map, modality, hrmax))
+    else:
+        st.markdown(make_weekly_feedback_basic(target, modality, hrmax))
 
 st.subheader("Plan anual")
 profile = UserProfile(
@@ -1026,6 +1087,7 @@ profile = UserProfile(
     modality=str(modality),
     start_date=start_date,
 )
+
 plan = build_plan(profile, baseline, hrmax)
 st.dataframe(plan.head(21), use_container_width=True)
 
